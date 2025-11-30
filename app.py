@@ -1,349 +1,373 @@
+"""
+Parkinson's Disease Risk Assessment Application
+
+A modern ML-powered tool for assessing Parkinson's disease risk using:
+1. Voice analysis with audio biomarker extraction
+2. Manual measurement input
+3. Session history tracking
+
+Built with real clinical datasets (UCI + Oxford) and XGBoost ML pipeline.
+"""
+
 import gradio as gr
-import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, classification_report
-import joblib
+import pandas as pd
 import os
+from datetime import datetime
+from typing import Optional, Tuple, Dict, Any
 import warnings
+import threading
 
 warnings.filterwarnings('ignore')
 
+# Import our modules
+from src.data_loader import DataLoader
+from src.voice_analyzer import VoiceAnalyzer, PARSELMOUTH_AVAILABLE, LIBROSA_AVAILABLE
+from src.model_trainer import ModelTrainer, SHAP_AVAILABLE
+from src.database import DatabaseManager
 
-class ParkinsonsPredictor:
+
+class ParkinsonsApp:
+    """Main application class for Parkinson's Disease Risk Assessment."""
+    
     def __init__(self):
-        self.model = None
-        self.scaler = StandardScaler()
-        self.feature_names = [
-            'age', 'tremor_at_rest', 'bradykinesia', 'rigidity',
-            'postural_instability', 'speech_problems', 'writing_changes',
-            'sleep_disorders', 'smell_loss', 'depression_anxiety',
-            'family_history', 'head_trauma', 'pesticide_exposure'
-        ]
-        # Try to load existing model, if not available, train a new one
-        if not self.load_model():
-            self.train_model()
+        """Initialize the application components."""
+        print("\n" + "=" * 60)
+        print("🧠 Parkinson's Disease Risk Assessment System")
+        print("=" * 60)
+        
+        self.data_dir = "data"
+        self.models_dir = "models"
+        
+        os.makedirs(self.data_dir, exist_ok=True)
+        os.makedirs(self.models_dir, exist_ok=True)
+        
+        # Initialize components
+        self.db = DatabaseManager(db_path=os.path.join(self.data_dir, "history.db"))
+        self.voice_analyzer = VoiceAnalyzer() if (PARSELMOUTH_AVAILABLE or LIBROSA_AVAILABLE) else None
+        self.model_trainer = ModelTrainer(data_dir=self.data_dir, models_dir=self.models_dir)
+        
+        # Training status
+        self.is_trained = False
+        self.training_in_progress = False
+        
+        # Try to load existing model
+        if self.model_trainer.model_exists():
+            self.model_trainer.load_model()
+            self.is_trained = True
+    
+    def get_model_status(self) -> Tuple[str, str, str]:
+        """Get model status for display."""
+        if self.is_trained and self.model_trainer.metrics:
+            m = self.model_trainer.metrics
+            return (
+                f"✓ {m.get('model_type', 'Model').upper()} Ready",
+                f"{m.get('test_accuracy', 0):.1%}",
+                f"{m.get('test_roc_auc', 0):.1%}"
+            )
+        return ("○ Not Trained", "—", "—")
+    
+    def start_training(self) -> Tuple[str, str, str]:
+        """Start model training."""
+        if self.training_in_progress:
+            return ("⏳ Training...", "—", "—")
+        
+        if not self.is_trained:
+            self.training_in_progress = True
+            try:
+                self.model_trainer.train(n_trials=30)
+                self.is_trained = True
+            finally:
+                self.training_in_progress = False
+        
+        return self.get_model_status()
+    
+    def predict_from_voice(self, audio_file) -> Tuple[str, str, str, Optional[str]]:
+        """Analyze voice recording for Parkinson's risk."""
+        if audio_file is None:
+            return ("—", "Upload an audio file to begin", "", None)
+        
+        if not self.is_trained:
+            return ("—", "Please train the model first", "", None)
+        
+        if self.voice_analyzer is None:
+            return ("—", "Voice analysis unavailable", "", None)
+        
+        try:
+            # Extract features and predict
+            features = self.voice_analyzer.extract_features(audio_file)
+            feature_dict = features.to_dict()
+            result = self.model_trainer.predict_with_explanation(features.to_array())
+            shap_plot = self.model_trainer.get_shap_plot(features.to_array())
+            
+            # Save to database
+            self.db.save_prediction(
+                input_type='voice',
+                features=feature_dict,
+                risk_score=result['probability'],
+                risk_level=result['risk_level'],
+                confidence_interval=result['confidence_interval'],
+                shap_values=result.get('feature_contributions'),
+                audio_filename=os.path.basename(audio_file) if audio_file else None,
+                audio_duration=features.duration_seconds
+            )
+            
+            # Format output
+            risk_pct = f"{result['risk_percentage']:.0f}%"
+            ci = f"{result['confidence_interval'][0]*100:.0f}–{result['confidence_interval'][1]*100:.0f}%"
+            
+            details = f"""**Duration:** {features.duration_seconds:.1f}s  •  **Method:** {features.extraction_method}
 
-    def generate_synthetic_data(self, n_samples=1000):
-        """Generate synthetic data for demonstration purposes"""
-        np.random.seed(42)
-        data = []
-
-        for _ in range(n_samples):
-            # Generate features with realistic correlations
-            age = np.random.normal(65, 15)
-            age = max(30, min(90, age))  # Clamp between 30-90
-
-            # Higher risk features for older individuals
-            age_factor = (age - 30) / 60  # Normalize age factor
-
-            tremor = np.random.choice([0, 1], p=[0.7 - 0.2 * age_factor, 0.3 + 0.2 * age_factor])
-            bradykinesia = np.random.choice([0, 1], p=[0.75 - 0.2 * age_factor, 0.25 + 0.2 * age_factor])
-            rigidity = np.random.choice([0, 1], p=[0.8 - 0.15 * age_factor, 0.2 + 0.15 * age_factor])
-            postural = np.random.choice([0, 1], p=[0.85 - 0.15 * age_factor, 0.15 + 0.15 * age_factor])
-            speech = np.random.choice([0, 1], p=[0.8, 0.2])
-            writing = np.random.choice([0, 1], p=[0.75, 0.25])
-            sleep = np.random.choice([0, 1], p=[0.6, 0.4])
-            smell = np.random.choice([0, 1], p=[0.7, 0.3])
-            depression = np.random.choice([0, 1], p=[0.7, 0.3])
-            family_hist = np.random.choice([0, 1], p=[0.9, 0.1])
-            head_trauma = np.random.choice([0, 1], p=[0.85, 0.15])
-            pesticide = np.random.choice([0, 1], p=[0.9, 0.1])
-
-            # Calculate target based on risk factors
-            risk_score = (tremor * 0.25 + bradykinesia * 0.25 + rigidity * 0.2 +
-                          postural * 0.15 + speech * 0.1 + writing * 0.1 +
-                          sleep * 0.05 + smell * 0.1 + depression * 0.05 +
-                          family_hist * 0.15 + head_trauma * 0.05 + pesticide * 0.05 +
-                          age_factor * 0.2)
-
-            # Add some noise and create binary target
-            risk_score += np.random.normal(0, 0.1)
-            target = 1 if risk_score > 0.4 else 0
-
-            data.append([
-                age, tremor, bradykinesia, rigidity, postural, speech, writing,
-                sleep, smell, depression, family_hist, head_trauma, pesticide, target
+| Biomarker | Value | | Biomarker | Value |
+|:--|--:|:--|:--|--:|
+| Jitter | {feature_dict['Jitter(%)']:.3f}% | | Shimmer | {feature_dict['Shimmer']:.4f} |
+| HNR | {feature_dict['HNR']:.1f} dB | | NHR | {feature_dict['NHR']:.4f} |
+| RPDE | {feature_dict['RPDE']:.3f} | | DFA | {feature_dict['DFA']:.3f} |
+| PPE | {feature_dict['PPE']:.3f} | | | |"""
+            
+            return (risk_pct, f"Risk Level: **{result['risk_level']}**  •  Confidence: {ci}", details, shap_plot)
+            
+        except Exception as e:
+            return ("—", f"Error: {str(e)}", "", None)
+    
+    def predict_from_manual(self, jitter, jitter_abs, shimmer, shimmer_db, nhr, hnr, rpde, dfa, ppe) -> Tuple[str, str, Optional[str]]:
+        """Predict from manual input."""
+        if not self.is_trained:
+            return ("—", "Please train the model first", None)
+        
+        try:
+            features = np.array([
+                jitter, jitter_abs, jitter/3, jitter/2.5, jitter,
+                shimmer, shimmer_db, shimmer/3, shimmer/4, shimmer/5, shimmer,
+                nhr, hnr, rpde, dfa, ppe
             ])
-
-        columns = self.feature_names + ['target']
-        return pd.DataFrame(data, columns=columns)
-
-    def save_model(self):
-        """Save the trained model and scaler using joblib"""
-        try:
-            # Create models directory if it doesn't exist
-            os.makedirs('models', exist_ok=True)
-
-            # Save model and scaler
-            joblib.dump(self.model, 'models/parkinsons_model.pkl')
-            joblib.dump(self.scaler, 'models/parkinsons_scaler.pkl')
-            print("Model and scaler saved successfully!")
+            
+            result = self.model_trainer.predict_with_explanation(features)
+            shap_plot = self.model_trainer.get_shap_plot(features)
+            
+            # Save to database
+            feature_names = self.model_trainer.feature_names
+            self.db.save_prediction(
+                input_type='manual',
+                features=dict(zip(feature_names, features)),
+                risk_score=result['probability'],
+                risk_level=result['risk_level'],
+                confidence_interval=result['confidence_interval'],
+                shap_values=result.get('feature_contributions')
+            )
+            
+            risk_pct = f"{result['risk_percentage']:.0f}%"
+            ci = f"{result['confidence_interval'][0]*100:.0f}–{result['confidence_interval'][1]*100:.0f}%"
+            
+            return (risk_pct, f"Risk Level: **{result['risk_level']}**  •  Confidence: {ci}", shap_plot)
+            
         except Exception as e:
-            print(f"Error saving model: {e}")
-
-    def load_model(self):
-        """Load pre-trained model and scaler using joblib"""
-        try:
-            if os.path.exists('models/parkinsons_model.pkl') and os.path.exists('models/parkinsons_scaler.pkl'):
-                self.model = joblib.load('models/parkinsons_model.pkl')
-                self.scaler = joblib.load('models/parkinsons_scaler.pkl')
-                print("Pre-trained model loaded successfully!")
-                return True
-            return False
-        except Exception as e:
-            print(f"Error loading model: {e}")
-            return False
-
-    def train_model(self):
-        """Train the machine learning model"""
-        # Generate synthetic dataset
-        df = self.generate_synthetic_data()
-
-        X = df[self.feature_names]
-        y = df['target']
-
-        # Split the data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
-        )
-
-        # Scale the features
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
-
-        # Train Random Forest model
-        self.model = RandomForestClassifier(
-            n_estimators=100,
-            random_state=42,
-            max_depth=10,
-            min_samples_split=5,
-            min_samples_leaf=2
-        )
-
-        self.model.fit(X_train_scaled, y_train)
-
-        # Evaluate model
-        y_pred = self.model.predict(X_test_scaled)
-        accuracy = accuracy_score(y_test, y_pred)
-
-        # Print detailed evaluation
-        print(f"Model Accuracy: {accuracy:.2f}")
-        print("\nClassification Report:")
-        print(classification_report(y_test, y_pred, target_names=['Low Risk', 'High Risk']))
-
-        # Save the trained model and scaler
-        self.save_model()
-
-    def predict_risk(self, age, tremor, bradykinesia, rigidity, postural,
-                     speech, writing, sleep, smell, depression, family, trauma, pesticide):
-        """Predict Parkinson's risk based on input symptoms"""
-
-        # Prepare input data
-        input_data = np.array([[
-            age, tremor, bradykinesia, rigidity, postural, speech, writing,
-            sleep, smell, depression, family, trauma, pesticide
-        ]])
-
-        # Scale the input
-        input_scaled = self.scaler.transform(input_data)
-
-        # Get prediction and probability
-        prediction = self.model.predict(input_scaled)[0]
-        probability = self.model.predict_proba(input_scaled)[0]
-
-        risk_percentage = probability[1] * 100
-
-        # Generate detailed response
-        if risk_percentage < 20:
-            risk_level = "Low"
-            recommendation = "Your symptoms suggest a low risk for Parkinson's disease. Continue maintaining a healthy lifestyle."
-        elif risk_percentage < 50:
-            risk_level = "Moderate"
-            recommendation = "Your symptoms suggest moderate risk. Consider consulting with a neurologist for further evaluation."
-        else:
-            risk_level = "High"
-            recommendation = "Your symptoms suggest higher risk. It's recommended to consult with a neurologist as soon as possible for proper evaluation."
-
-        # Feature importance for explanation
-        feature_importance = self.model.feature_importances_
-        input_values = [age, tremor, bradykinesia, rigidity, postural, speech, writing,
-                        sleep, smell, depression, family, trauma, pesticide]
-
-        important_factors = []
-        for i, (feature, importance, value) in enumerate(zip(self.feature_names, feature_importance, input_values)):
-            if importance > 0.05 and value > 0:  # Only show important factors that are present
-                important_factors.append(f"• {feature.replace('_', ' ').title()}")
-
-        explanation = "Key factors contributing to this assessment:\n" + "\n".join(important_factors[:5])
-
-        return {
-            "Risk Level": risk_level,
-            "Risk Percentage": f"{risk_percentage:.1f}%",
-            "Recommendation": recommendation,
-            "Explanation": explanation,
-            "Disclaimer": "⚠️ This is an AI-based assessment tool for educational purposes only. It is NOT a substitute for professional medical diagnosis. Please consult with a qualified healthcare provider for proper medical evaluation."
-        }
+            return ("—", f"Error: {str(e)}", None)
+    
+    def get_history(self) -> pd.DataFrame:
+        """Get prediction history."""
+        history = self.db.get_history(limit=50)
+        if not history:
+            return pd.DataFrame(columns=['Date', 'Type', 'Risk', 'Score'])
+        
+        return pd.DataFrame([{
+            'Date': h['timestamp'][:16].replace('T', ' ') if h['timestamp'] else '',
+            'Type': '🎤' if h['input_type'] == 'voice' else '✏️',
+            'Risk': h['risk_level'],
+            'Score': f"{h['risk_percentage']:.0f}%"
+        } for h in history])
+    
+    def get_stats(self) -> str:
+        """Get statistics summary."""
+        s = self.db.get_statistics()
+        if s['total_predictions'] == 0:
+            return "No predictions yet"
+        return f"**{s['total_predictions']}** total  •  🎤 {s['voice_analyses']}  •  ✏️ {s['symptom_assessments']}  •  Avg: **{s['average_risk_score']*100:.0f}%**"
+    
+    def clear_history(self) -> Tuple[pd.DataFrame, str]:
+        """Clear all history."""
+        self.db.clear_all()
+        return self.get_history(), "History cleared"
 
 
-# Initialize the predictor
-predictor = ParkinsonsPredictor()
+def create_app():
+    """Create the Gradio application with modern UI."""
+    
+    app = ParkinsonsApp()
+    status, acc, auc = app.get_model_status()
+    
+    with gr.Blocks(
+        title="Parkinson's Risk Assessment",
+        fill_height=True
+    ) as interface:
+        
+        # Header
+        gr.HTML("""
+        <div class="header-section">
+            <h1 style="font-size: 1.6rem; font-weight: 600; color: #1e293b; margin: 0;">
+                Parkinson's Risk Assessment
+            </h1>
+            <p style="color: #64748b; margin-top: 0.4rem; font-size: 0.9rem;">
+                AI-powered voice biomarker analysis
+            </p>
+        </div>
+        """)
+        
+        # Status Bar
+        with gr.Row():
+            with gr.Column(scale=1, min_width=100):
+                gr.HTML('<p class="stat-label">STATUS</p>')
+                model_status = gr.Markdown(f"**{status}**")
+            with gr.Column(scale=1, min_width=100):
+                gr.HTML('<p class="stat-label">ACCURACY</p>')
+                model_acc = gr.Markdown(f"**{acc}**")
+            with gr.Column(scale=1, min_width=100):
+                gr.HTML('<p class="stat-label">ROC AUC</p>')
+                model_auc = gr.Markdown(f"**{auc}**")
+            with gr.Column(scale=1, min_width=120):
+                train_btn = gr.Button("Train Model", variant="secondary", size="sm")
+        
+        gr.HTML('<hr style="border: none; border-top: 1px solid #e2e8f0; margin: 1rem 0;">')
+        
+        # Main Content
+        with gr.Tabs():
+            
+            # Voice Tab
+            with gr.TabItem("🎤 Voice", id="voice"):
+                gr.HTML("""
+                <div class="info-box">
+                    <p style="margin: 0; color: #475569; font-size: 0.875rem;">
+                        Record or upload a sustained <strong>"ahhh"</strong> sound (3–10 seconds).
+                        The AI extracts jitter, shimmer, and harmonic features.
+                    </p>
+                </div>
+                """)
+                
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        audio_input = gr.Audio(
+                            label="Voice Recording",
+                            type="filepath",
+                            sources=["upload", "microphone"]
+                        )
+                        analyze_btn = gr.Button("Analyze", variant="primary", size="lg")
+                    
+                    with gr.Column(scale=1):
+                        gr.HTML('<p class="stat-label">RISK SCORE</p>')
+                        voice_score = gr.Markdown("—", elem_classes=["score-big"])
+                        voice_summary = gr.Markdown("Upload audio to begin")
+                
+                with gr.Accordion("📊 Details", open=False):
+                    voice_details = gr.Markdown("")
+                    voice_shap = gr.Image(show_label=False, height=300)
+                
+                analyze_btn.click(
+                    fn=app.predict_from_voice,
+                    inputs=[audio_input],
+                    outputs=[voice_score, voice_summary, voice_details, voice_shap]
+                )
+            
+            # Manual Tab
+            with gr.TabItem("✏️ Manual", id="manual"):
+                gr.HTML("""
+                <div class="info-box">
+                    <p style="margin: 0; color: #475569; font-size: 0.875rem;">
+                        Enter voice measurements from clinical equipment.
+                    </p>
+                </div>
+                """)
+                
+                with gr.Row():
+                    with gr.Column():
+                        jitter = gr.Slider(0, 3, value=0.5, step=0.01, label="Jitter (%)", info="Frequency variation")
+                        jitter_abs = gr.Slider(0, 0.0005, value=0.00003, step=0.00001, label="Jitter (Abs)")
+                        shimmer = gr.Slider(0, 0.3, value=0.03, step=0.005, label="Shimmer", info="Amplitude variation")
+                        shimmer_db = gr.Slider(0, 1.5, value=0.3, step=0.05, label="Shimmer (dB)")
+                    
+                    with gr.Column():
+                        nhr = gr.Slider(0, 0.3, value=0.02, step=0.005, label="NHR", info="Noise-to-harmonics")
+                        hnr = gr.Slider(5, 35, value=22, step=0.5, label="HNR (dB)", info="Harmonics-to-noise")
+                        rpde = gr.Slider(0.2, 0.8, value=0.5, step=0.01, label="RPDE")
+                        dfa = gr.Slider(0.5, 0.9, value=0.7, step=0.01, label="DFA")
+                        ppe = gr.Slider(0, 0.4, value=0.2, step=0.01, label="PPE")
+                
+                assess_btn = gr.Button("Assess Risk", variant="primary", size="lg")
+                
+                gr.HTML('<p class="stat-label" style="margin-top: 1rem;">RESULT</p>')
+                with gr.Row():
+                    manual_score = gr.Markdown("—", elem_classes=["score-big"])
+                    manual_summary = gr.Markdown("Adjust values and assess")
+                
+                manual_shap = gr.Image(show_label=False, height=280)
+                
+                assess_btn.click(
+                    fn=app.predict_from_manual,
+                    inputs=[jitter, jitter_abs, shimmer, shimmer_db, nhr, hnr, rpde, dfa, ppe],
+                    outputs=[manual_score, manual_summary, manual_shap]
+                )
+            
+            # History Tab
+            with gr.TabItem("📊 History", id="history"):
+                with gr.Row():
+                    stats_display = gr.Markdown(app.get_stats())
+                with gr.Row():
+                    refresh_btn = gr.Button("↻ Refresh", size="sm")
+                    clear_btn = gr.Button("Clear All", variant="stop", size="sm")
+                
+                history_table = gr.DataFrame(value=app.get_history(), interactive=False)
+                clear_msg = gr.Markdown("")
+                
+                refresh_btn.click(fn=app.get_history, outputs=history_table)
+                refresh_btn.click(fn=app.get_stats, outputs=stats_display)
+                clear_btn.click(fn=app.clear_history, outputs=[history_table, clear_msg])
+            
+            # About Tab
+            with gr.TabItem("ℹ️ About", id="about"):
+                gr.Markdown("""
+### Voice Biomarkers
 
+| Biomarker | What it measures | Parkinson's effect |
+|:--|:--|:--|
+| **Jitter** | Pitch instability | ↑ Increased |
+| **Shimmer** | Volume instability | ↑ Increased |
+| **HNR** | Voice clarity | ↓ Decreased |
+| **RPDE, DFA, PPE** | Signal dynamics | Altered |
 
-def chatbot_interface(age, tremor, bradykinesia, rigidity, postural, speech, writing,
-                      sleep, smell, depression, family, trauma, pesticide):
-    """Main chatbot interface function"""
-    try:
-        result = predictor.predict_risk(
-            age, tremor, bradykinesia, rigidity, postural, speech, writing,
-            sleep, smell, depression, family, trauma, pesticide
-        )
+### Data & Model
 
-        response = f"""
-# Parkinson's Disease Risk Assessment
-
-**Risk Level:** {result['Risk Level']}
-**Risk Percentage:** {result['Risk Percentage']}
-
-## Recommendation
-{result['Recommendation']}
-
-## Analysis
-{result['Explanation']}
+- **6,000+** voice samples from UCI & Oxford datasets
+- **XGBoost** classifier with Optuna tuning
+- **SHAP** values for explainability
 
 ---
-{result['Disclaimer']}
-        """
-
-        return response
-
-    except Exception as e:
-        return f"An error occurred during assessment: {str(e)}"
-
-
-# Create Gradio interface
-def create_interface():
-    with gr.Blocks(title="Parkinson's Disease Risk Assessment", theme=gr.themes.Soft()) as iface:
-        gr.Markdown(
-            """
-            # 🧠 Parkinson's Disease Risk Assessment Chatbot
-
-            This AI-powered tool helps assess your risk of Parkinson's disease based on common symptoms and risk factors.
-            Please answer the questions below honestly for the most accurate assessment.
-
-            **Important:** This tool is for educational purposes only and should not replace professional medical advice.
-            """
-        )
-
-        with gr.Row():
-            with gr.Column():
-                gr.Markdown("### Basic Information")
-                age = gr.Slider(
-                    minimum=30, maximum=90, value=65, step=1,
-                    label="Age", info="Your current age"
-                )
-
-                gr.Markdown("### Motor Symptoms")
-                tremor = gr.Checkbox(
-                    label="Tremor at Rest",
-                    info="Do you experience shaking when your muscles are relaxed?"
-                )
-                bradykinesia = gr.Checkbox(
-                    label="Bradykinesia (Slowness)",
-                    info="Have you noticed slowness in your movements?"
-                )
-                rigidity = gr.Checkbox(
-                    label="Muscle Rigidity",
-                    info="Do you experience muscle stiffness or rigidity?"
-                )
-                postural = gr.Checkbox(
-                    label="Postural Instability",
-                    info="Do you have trouble with balance or posture?"
-                )
-
-            with gr.Column():
-                gr.Markdown("### Non-Motor Symptoms")
-                speech = gr.Checkbox(
-                    label="Speech Problems",
-                    info="Have you noticed changes in your speech (softer, slurred)?"
-                )
-                writing = gr.Checkbox(
-                    label="Writing Changes",
-                    info="Has your handwriting become smaller or more difficult?"
-                )
-                sleep = gr.Checkbox(
-                    label="Sleep Disorders",
-                    info="Do you experience sleep disturbances or REM sleep behavior?"
-                )
-                smell = gr.Checkbox(
-                    label="Loss of Smell",
-                    info="Have you experienced a reduced sense of smell?"
-                )
-                depression = gr.Checkbox(
-                    label="Depression/Anxiety",
-                    info="Have you experienced depression or anxiety symptoms?"
-                )
-
-                gr.Markdown("### Risk Factors")
-                family = gr.Checkbox(
-                    label="Family History",
-                    info="Do you have family members with Parkinson's disease?"
-                )
-                trauma = gr.Checkbox(
-                    label="Head Trauma History",
-                    info="Have you experienced significant head injuries?"
-                )
-                pesticide = gr.Checkbox(
-                    label="Pesticide Exposure",
-                    info="Have you been exposed to pesticides or herbicides?"
-                )
-
-        with gr.Row():
-            assess_btn = gr.Button("🔍 Assess Risk", variant="primary", size="lg")
-            clear_btn = gr.Button("🗑️ Clear All", variant="secondary")
-
-        output = gr.Markdown()
-
-        # Event handlers
-        assess_btn.click(
-            fn=chatbot_interface,
-            inputs=[age, tremor, bradykinesia, rigidity, postural, speech, writing,
-                    sleep, smell, depression, family, trauma, pesticide],
-            outputs=output
-        )
-
-        def clear_all():
-            return (65, False, False, False, False, False, False,
-                    False, False, False, False, False, False, "")
-
-        clear_btn.click(
-            fn=clear_all,
-            outputs=[age, tremor, bradykinesia, rigidity, postural, speech, writing,
-                     sleep, smell, depression, family, trauma, pesticide, output]
-        )
-
-        gr.Markdown(
-            """
-            ---
-            ### About This Tool
-            This chatbot uses machine learning to analyze symptom patterns associated with Parkinson's disease risk.
-            The model is trained on symptom correlations and provides educational insights only.
-
-            **Always consult with healthcare professionals for proper medical evaluation and diagnosis.**
-            """
-        )
-
-    return iface
+                """)
+                
+                gr.HTML("""
+                <div class="disclaimer-box">
+                    <strong>⚠️ Disclaimer</strong><br>
+                    This is a screening tool for educational purposes. 
+                    It cannot diagnose Parkinson's disease. Consult a neurologist for medical evaluation.
+                </div>
+                """)
+        
+        # Footer
+        gr.HTML("""
+        <div style="text-align: center; padding: 1rem 0; margin-top: 1rem; border-top: 1px solid #e2e8f0;">
+            <p style="color: #94a3b8; font-size: 0.75rem; margin: 0;">
+                ⚠️ Screening tool only — not a medical diagnosis
+            </p>
+        </div>
+        """)
+        
+        train_btn.click(fn=app.start_training, outputs=[model_status, model_acc, model_auc])
+    
+    return interface
 
 
-# Launch the application
 if __name__ == "__main__":
-    interface = create_interface()
+    interface = create_app()
     interface.launch(
-        server_name="localhost",
+        server_name="0.0.0.0",
         server_port=7860,
-        share=True,
-        debug=True
+        share=False
     )
