@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "framework": "nextjs",
+  "functions": {
+    "api/extract-features.py": {
+      "runtime": "python3.11",
+      "maxDuration": 10
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/extract-features",
+      "destination": "/api/extract-features.py"
+    }
+  ]
+}
