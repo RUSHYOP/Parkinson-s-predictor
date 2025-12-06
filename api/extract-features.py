@@ -1,193 +1,35 @@
 """
 Voice feature extraction API for Parkinson's Disease Predictor.
-Uses parselmouth (Praat) for clinical-grade voice analysis.
+Uses librosa for audio analysis - approximates clinical voice biomarkers.
 """
 
 from http.server import BaseHTTPRequestHandler
 import json
 import tempfile
 import os
-import io
 import numpy as np
-
-# Check for available libraries
-PARSELMOUTH_AVAILABLE = False
-LIBROSA_AVAILABLE = False
-
-try:
-    import parselmouth
-    from parselmouth.praat import call
-    PARSELMOUTH_AVAILABLE = True
-except ImportError:
-    pass
-
-try:
-    import librosa
-    LIBROSA_AVAILABLE = True
-except ImportError:
-    pass
+import librosa
 
 
-def extract_features_parselmouth(audio_path: str) -> dict:
-    """Extract voice features using parselmouth (Praat)."""
-    sound = parselmouth.Sound(audio_path)
+def extract_features(audio_path: str) -> dict:
+    """Extract voice features using librosa."""
+    # Load audio
+    y, sr = librosa.load(audio_path, sr=22050, mono=True)
     
-    # Get pitch and point process for jitter/shimmer
-    pitch = call(sound, "To Pitch", 0.0, 75, 600)
-    point_process = call(sound, "To PointProcess (periodic, cc)", 75, 600)
-    
-    # Jitter measurements
-    jitter_percent = call(point_process, "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3)
-    jitter_abs = call(point_process, "Get jitter (local, absolute)", 0, 0, 0.0001, 0.02, 1.3)
-    jitter_rap = call(point_process, "Get jitter (rap)", 0, 0, 0.0001, 0.02, 1.3)
-    jitter_ppq5 = call(point_process, "Get jitter (ppq5)", 0, 0, 0.0001, 0.02, 1.3)
-    jitter_ddp = jitter_rap * 3  # DDP = 3 * RAP
-    
-    # Shimmer measurements
-    shimmer = call([sound, point_process], "Get shimmer (local)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
-    shimmer_db = call([sound, point_process], "Get shimmer (local_dB)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
-    shimmer_apq3 = call([sound, point_process], "Get shimmer (apq3)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
-    shimmer_apq5 = call([sound, point_process], "Get shimmer (apq5)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
-    shimmer_apq11 = call([sound, point_process], "Get shimmer (apq11)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
-    shimmer_dda = shimmer_apq3 * 3  # DDA = 3 * APQ3
-    
-    # Harmonicity (HNR)
-    harmonicity = call(sound, "To Harmonicity (cc)", 0.01, 75, 0.1, 1.0)
-    hnr = call(harmonicity, "Get mean", 0, 0)
-    
-    # NHR (inverse of HNR, simplified)
-    nhr = 1 / (10 ** (hnr / 10)) if hnr > 0 else 0
-    
-    # Nonlinear dynamics features (simplified approximations)
-    # These would ideally use specialized algorithms
-    rpde = estimate_rpde(sound)
-    dfa = estimate_dfa(sound)
-    ppe = estimate_ppe(pitch)
-    
-    # Handle NaN values
-    def safe_value(v, default=0.0):
-        if v is None or (isinstance(v, float) and np.isnan(v)):
-            return default
-        return float(v)
-    
-    return {
-        'Jitter(%)': safe_value(jitter_percent * 100),
-        'Jitter(Abs)': safe_value(jitter_abs),
-        'Jitter:RAP': safe_value(jitter_rap * 100),
-        'Jitter:PPQ5': safe_value(jitter_ppq5 * 100),
-        'Jitter:DDP': safe_value(jitter_ddp * 100),
-        'Shimmer': safe_value(shimmer),
-        'Shimmer(dB)': safe_value(shimmer_db),
-        'Shimmer:APQ3': safe_value(shimmer_apq3),
-        'Shimmer:APQ5': safe_value(shimmer_apq5),
-        'Shimmer:APQ11': safe_value(shimmer_apq11),
-        'Shimmer:DDA': safe_value(shimmer_dda),
-        'NHR': safe_value(nhr),
-        'HNR': safe_value(hnr),
-        'RPDE': safe_value(rpde),
-        'DFA': safe_value(dfa),
-        'PPE': safe_value(ppe),
-    }
-
-
-def estimate_rpde(sound) -> float:
-    """Estimate RPDE (Recurrence Period Density Entropy)."""
-    # Simplified estimation based on signal complexity
-    try:
-        samples = sound.values[0]
-        if len(samples) < 100:
-            return 0.5
-        
-        # Compute approximate entropy as proxy for RPDE
-        diff = np.diff(samples)
-        hist, _ = np.histogram(diff, bins=50, density=True)
-        hist = hist[hist > 0]
-        entropy = -np.sum(hist * np.log2(hist + 1e-10))
-        
-        # Normalize to typical RPDE range (0.3-0.7)
-        return np.clip(entropy / 10, 0.3, 0.7)
-    except:
-        return 0.5
-
-
-def estimate_dfa(sound) -> float:
-    """Estimate DFA (Detrended Fluctuation Analysis)."""
-    # Simplified DFA estimation
-    try:
-        samples = sound.values[0]
-        if len(samples) < 100:
-            return 0.7
-        
-        # Compute Hurst exponent as proxy for DFA
-        n = len(samples)
-        cumsum = np.cumsum(samples - np.mean(samples))
-        
-        # Use different window sizes
-        scales = [10, 20, 50, 100]
-        fluctuations = []
-        
-        for scale in scales:
-            if scale > n // 2:
-                continue
-            n_windows = n // scale
-            fluct = 0
-            for i in range(n_windows):
-                segment = cumsum[i*scale:(i+1)*scale]
-                trend = np.polyval(np.polyfit(range(scale), segment, 1), range(scale))
-                fluct += np.sqrt(np.mean((segment - trend) ** 2))
-            fluctuations.append(fluct / n_windows)
-        
-        if len(fluctuations) < 2:
-            return 0.7
-        
-        # Estimate scaling exponent
-        alpha = np.polyfit(np.log(scales[:len(fluctuations)]), np.log(fluctuations), 1)[0]
-        
-        # Normalize to typical DFA range (0.5-0.9)
-        return np.clip(alpha, 0.5, 0.9)
-    except:
-        return 0.7
-
-
-def estimate_ppe(pitch) -> float:
-    """Estimate PPE (Pitch Period Entropy)."""
-    try:
-        # Get pitch values
-        pitch_values = pitch.selected_array['frequency']
-        pitch_values = pitch_values[pitch_values > 0]
-        
-        if len(pitch_values) < 10:
-            return 0.2
-        
-        # Compute entropy of pitch periods
-        periods = 1 / pitch_values
-        hist, _ = np.histogram(periods, bins=30, density=True)
-        hist = hist[hist > 0]
-        entropy = -np.sum(hist * np.log2(hist + 1e-10))
-        
-        # Normalize to typical PPE range (0.1-0.5)
-        return np.clip(entropy / 10, 0.1, 0.5)
-    except:
-        return 0.2
-
-
-def extract_features_librosa(audio_path: str) -> dict:
-    """Extract voice features using librosa (fallback)."""
-    y, sr = librosa.load(audio_path, sr=22050)
-    
-    # Basic features that approximate clinical measures
-    # These are approximations, not true jitter/shimmer
+    if len(y) < sr * 0.5:  # Less than 0.5 seconds
+        raise ValueError("Audio too short. Please provide at least 0.5 seconds of audio.")
     
     # Spectral features
     spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
     spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
+    spectral_flatness = librosa.feature.spectral_flatness(y=y)[0]
     zcr = librosa.feature.zero_crossing_rate(y)[0]
     
     # RMS energy for shimmer approximation
     rms = librosa.feature.rms(y=y)[0]
     
     # Pitch tracking for jitter approximation
-    pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+    pitches, magnitudes = librosa.piptrack(y=y, sr=sr, fmin=75, fmax=600)
     pitch_values = []
     for t in range(pitches.shape[1]):
         index = magnitudes[:, t].argmax()
@@ -195,44 +37,153 @@ def extract_features_librosa(audio_path: str) -> dict:
         if pitch > 0:
             pitch_values.append(pitch)
     
-    # Calculate approximations
-    if len(pitch_values) > 1:
+    # Calculate jitter approximations
+    if len(pitch_values) > 10:
         pitch_array = np.array(pitch_values)
-        jitter_approx = np.std(np.diff(pitch_array)) / np.mean(pitch_array) * 100
-        jitter_abs_approx = np.mean(np.abs(np.diff(1 / pitch_array)))
+        periods = 1 / pitch_array
+        
+        # Jitter (local) - average absolute difference between consecutive periods
+        period_diffs = np.abs(np.diff(periods))
+        jitter_abs = float(np.mean(period_diffs))
+        jitter_percent = float(jitter_abs / np.mean(periods) * 100) if np.mean(periods) > 0 else 0.5
+        
+        # RAP - Relative Average Perturbation (3-point)
+        if len(periods) >= 3:
+            rap_vals = []
+            for i in range(1, len(periods) - 1):
+                avg_neighbor = (periods[i-1] + periods[i] + periods[i+1]) / 3
+                rap_vals.append(abs(periods[i] - avg_neighbor))
+            jitter_rap = float(np.mean(rap_vals) / np.mean(periods) * 100) if len(rap_vals) > 0 else 0.3
+        else:
+            jitter_rap = jitter_percent * 0.6
+        
+        # PPQ5 - Five-point Period Perturbation Quotient
+        if len(periods) >= 5:
+            ppq_vals = []
+            for i in range(2, len(periods) - 2):
+                avg_neighbor = np.mean(periods[i-2:i+3])
+                ppq_vals.append(abs(periods[i] - avg_neighbor))
+            jitter_ppq5 = float(np.mean(ppq_vals) / np.mean(periods) * 100) if len(ppq_vals) > 0 else 0.3
+        else:
+            jitter_ppq5 = jitter_percent * 0.6
+        
+        jitter_ddp = jitter_rap * 3  # DDP = 3 * RAP
     else:
-        jitter_approx = 0.5
-        jitter_abs_approx = 0.00003
+        jitter_percent = 0.5
+        jitter_abs = 0.00003
+        jitter_rap = 0.3
+        jitter_ppq5 = 0.3
+        jitter_ddp = 0.9
     
-    if len(rms) > 1:
-        shimmer_approx = np.std(rms) / np.mean(rms)
-        shimmer_db_approx = 20 * np.log10(np.max(rms) / (np.min(rms) + 1e-10))
+    # Calculate shimmer approximations
+    if len(rms) > 10:
+        rms_nonzero = rms[rms > 0]
+        if len(rms_nonzero) > 10:
+            amp_diffs = np.abs(np.diff(rms_nonzero))
+            shimmer = float(np.mean(amp_diffs) / np.mean(rms_nonzero))
+            shimmer_db = float(20 * np.log10(np.max(rms_nonzero) / (np.min(rms_nonzero) + 1e-10)))
+            
+            # APQ3 - Three-point Amplitude Perturbation Quotient
+            if len(rms_nonzero) >= 3:
+                apq3_vals = []
+                for i in range(1, len(rms_nonzero) - 1):
+                    avg_neighbor = (rms_nonzero[i-1] + rms_nonzero[i] + rms_nonzero[i+1]) / 3
+                    apq3_vals.append(abs(rms_nonzero[i] - avg_neighbor))
+                shimmer_apq3 = float(np.mean(apq3_vals) / np.mean(rms_nonzero))
+            else:
+                shimmer_apq3 = shimmer * 0.5
+            
+            # APQ5
+            if len(rms_nonzero) >= 5:
+                apq5_vals = []
+                for i in range(2, len(rms_nonzero) - 2):
+                    avg_neighbor = np.mean(rms_nonzero[i-2:i+3])
+                    apq5_vals.append(abs(rms_nonzero[i] - avg_neighbor))
+                shimmer_apq5 = float(np.mean(apq5_vals) / np.mean(rms_nonzero))
+            else:
+                shimmer_apq5 = shimmer * 0.65
+            
+            # APQ11
+            if len(rms_nonzero) >= 11:
+                apq11_vals = []
+                for i in range(5, len(rms_nonzero) - 5):
+                    avg_neighbor = np.mean(rms_nonzero[i-5:i+6])
+                    apq11_vals.append(abs(rms_nonzero[i] - avg_neighbor))
+                shimmer_apq11 = float(np.mean(apq11_vals) / np.mean(rms_nonzero))
+            else:
+                shimmer_apq11 = shimmer * 0.8
+            
+            shimmer_dda = shimmer_apq3 * 3
+        else:
+            shimmer = 0.03
+            shimmer_db = 0.3
+            shimmer_apq3 = 0.015
+            shimmer_apq5 = 0.02
+            shimmer_apq11 = 0.025
+            shimmer_dda = 0.045
     else:
-        shimmer_approx = 0.03
-        shimmer_db_approx = 0.3
+        shimmer = 0.03
+        shimmer_db = 0.3
+        shimmer_apq3 = 0.015
+        shimmer_apq5 = 0.02
+        shimmer_apq11 = 0.025
+        shimmer_dda = 0.045
     
     # HNR approximation from spectral flatness
-    spectral_flatness = librosa.feature.spectral_flatness(y=y)[0]
-    hnr_approx = -10 * np.log10(np.mean(spectral_flatness) + 1e-10)
-    nhr_approx = 1 / (10 ** (hnr_approx / 10)) if hnr_approx > 0 else 0.03
+    mean_flatness = float(np.mean(spectral_flatness))
+    hnr = float(-10 * np.log10(mean_flatness + 1e-10))
+    hnr = np.clip(hnr, 0, 40)
+    
+    # NHR (inverse relationship with HNR)
+    nhr = float(1 / (10 ** (hnr / 10))) if hnr > 0 else 0.03
+    nhr = np.clip(nhr, 0, 0.4)
+    
+    # RPDE approximation - entropy of signal
+    hist, _ = np.histogram(y, bins=50, density=True)
+    hist = hist[hist > 0]
+    entropy = -np.sum(hist * np.log2(hist + 1e-10))
+    rpde = float(np.clip(entropy / 15, 0.3, 0.7))
+    
+    # DFA approximation - scaling exponent
+    dfa = float(np.clip(np.std(zcr) * 5 + 0.6, 0.5, 0.9))
+    
+    # PPE approximation - pitch entropy
+    if len(pitch_values) > 10:
+        pitch_hist, _ = np.histogram(pitch_values, bins=30, density=True)
+        pitch_hist = pitch_hist[pitch_hist > 0]
+        pitch_entropy = -np.sum(pitch_hist * np.log2(pitch_hist + 1e-10))
+        ppe = float(np.clip(pitch_entropy / 12, 0.1, 0.5))
+    else:
+        ppe = 0.2
+    
+    # Ensure all values are valid
+    def safe_value(v, default=0.0, min_val=None, max_val=None):
+        if v is None or np.isnan(v) or np.isinf(v):
+            return default
+        result = float(v)
+        if min_val is not None:
+            result = max(result, min_val)
+        if max_val is not None:
+            result = min(result, max_val)
+        return result
     
     return {
-        'Jitter(%)': float(np.clip(jitter_approx, 0, 3)),
-        'Jitter(Abs)': float(np.clip(jitter_abs_approx, 0, 0.0003)),
-        'Jitter:RAP': float(np.clip(jitter_approx * 0.6, 0, 2)),
-        'Jitter:PPQ5': float(np.clip(jitter_approx * 0.6, 0, 2)),
-        'Jitter:DDP': float(np.clip(jitter_approx * 1.8, 0, 5)),
-        'Shimmer': float(np.clip(shimmer_approx, 0, 0.2)),
-        'Shimmer(dB)': float(np.clip(shimmer_db_approx, 0, 2)),
-        'Shimmer:APQ3': float(np.clip(shimmer_approx * 0.5, 0, 0.1)),
-        'Shimmer:APQ5': float(np.clip(shimmer_approx * 0.65, 0, 0.15)),
-        'Shimmer:APQ11': float(np.clip(shimmer_approx * 0.8, 0, 0.15)),
-        'Shimmer:DDA': float(np.clip(shimmer_approx * 1.5, 0, 0.3)),
-        'NHR': float(np.clip(nhr_approx, 0, 0.4)),
-        'HNR': float(np.clip(hnr_approx, 0, 40)),
-        'RPDE': float(np.clip(np.mean(spectral_flatness) * 2, 0.3, 0.7)),
-        'DFA': float(np.clip(np.std(zcr) * 10 + 0.6, 0.5, 0.9)),
-        'PPE': float(np.clip(np.std(spectral_centroids) / np.mean(spectral_centroids), 0.1, 0.5)),
+        'Jitter(%)': safe_value(jitter_percent, 0.5, 0, 3),
+        'Jitter(Abs)': safe_value(jitter_abs, 0.00003, 0, 0.0003),
+        'Jitter:RAP': safe_value(jitter_rap, 0.3, 0, 2),
+        'Jitter:PPQ5': safe_value(jitter_ppq5, 0.3, 0, 2),
+        'Jitter:DDP': safe_value(jitter_ddp, 0.9, 0, 5),
+        'Shimmer': safe_value(shimmer, 0.03, 0, 0.2),
+        'Shimmer(dB)': safe_value(shimmer_db, 0.3, 0, 2),
+        'Shimmer:APQ3': safe_value(shimmer_apq3, 0.015, 0, 0.1),
+        'Shimmer:APQ5': safe_value(shimmer_apq5, 0.02, 0, 0.15),
+        'Shimmer:APQ11': safe_value(shimmer_apq11, 0.025, 0, 0.15),
+        'Shimmer:DDA': safe_value(shimmer_dda, 0.045, 0, 0.3),
+        'NHR': safe_value(nhr, 0.03, 0, 0.4),
+        'HNR': safe_value(hnr, 22, 0, 40),
+        'RPDE': safe_value(rpde, 0.5, 0.3, 0.7),
+        'DFA': safe_value(dfa, 0.7, 0.5, 0.9),
+        'PPE': safe_value(ppe, 0.2, 0.1, 0.5),
     }
 
 
@@ -245,7 +196,7 @@ class handler(BaseHTTPRequestHandler):
             # Read the body
             body = self.rfile.read(content_length)
             
-            # Parse multipart form data manually (simplified)
+            # Parse multipart form data
             content_type = self.headers.get('Content-Type', '')
             
             if 'multipart/form-data' in content_type:
@@ -279,24 +230,17 @@ class handler(BaseHTTPRequestHandler):
                 
                 try:
                     # Extract features
-                    if PARSELMOUTH_AVAILABLE:
-                        features = extract_features_parselmouth(temp_path)
-                        method = "parselmouth"
-                    elif LIBROSA_AVAILABLE:
-                        features = extract_features_librosa(temp_path)
-                        method = "librosa"
-                    else:
-                        self.send_error_response(500, "No audio processing library available")
-                        return
+                    features = extract_features(temp_path)
                     
                     # Send success response
                     response = {
                         "features": features,
-                        "extraction_method": method,
+                        "extraction_method": "librosa",
                     }
                     
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
                     self.end_headers()
                     self.wfile.write(json.dumps(response).encode())
                     
@@ -310,8 +254,16 @@ class handler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_error_response(500, str(e))
     
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+    
     def send_error_response(self, code: int, message: str):
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(json.dumps({"error": message}).encode())
