@@ -1,0 +1,53 @@
+{
+  "model_type": "xgboost",
+  "n_features": 16,
+  "feature_names": [
+    "Jitter:DDP",
+    "Shimmer:APQ3",
+    "Shimmer:APQ5",
+    "Shimmer:DDA",
+    "NHR",
+    "HNR",
+    "RPDE",
+    "DFA",
+    "PPE",
+    "Jitter(%)",
+    "Jitter(Abs)",
+    "Jitter:RAP",
+    "Jitter:PPQ5",
+    "Shimmer",
+    "Shimmer(dB)",
+    "Shimmer:APQ11"
+  ],
+  "feature_order": [
+    "Jitter:DDP",
+    "Shimmer:APQ3",
+    "Shimmer:APQ5",
+    "Shimmer:DDA",
+    "NHR",
+    "HNR",
+    "RPDE",
+    "DFA",
+    "PPE",
+    "Jitter(%)",
+    "Jitter(Abs)",
+    "Jitter:RAP",
+    "Jitter:PPQ5",
+    "Shimmer",
+    "Shimmer(dB)",
+    "Shimmer:APQ11"
+  ],
+  "accuracy": 0.7438220757825371,
+  "f1_score": 0.7549251379038613,
+  "roc_auc": 0.8244708143635521,
+  "best_params": {
+    "n_estimators": 279,
+    "max_depth": 10,
+    "learning_rate": 0.11549912057811672,
+    "subsample": 0.7970693771229763,
+    "colsample_bytree": 0.9968689883981365,
+    "min_child_weight": 3,
+    "gamma": 0.30319549387338723
+  },
+  "converted_at": "2025-12-05T20:27:00"
+}
